@@ -24,11 +24,14 @@ import json
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import IntEnum
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
+
+import requests
 
 # Paths -----------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -88,6 +91,7 @@ LOG_LEVELS = {
     "WARNING": logging.WARNING,
     "ERROR": logging.ERROR,
 }
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 class ExitCode(IntEnum):
@@ -711,6 +715,15 @@ def _as_token_usage(data: dict[str, int] | None) -> TokenUsage:
     return TokenUsage.from_dict(data)
 
 
+def _is_retryable_file_download_error(exc: Exception) -> bool:
+    """Detect retryable failures when downloading files from the API."""
+    if isinstance(exc, requests.HTTPError):
+        status = exc.response.status_code if exc.response else None
+        return status in RETRYABLE_STATUS_CODES
+    message = str(exc).lower()
+    return "server error" in message and "/files/" in message
+
+
 def run_extraction_stage(
     book_name: str,
     chapter: int,
@@ -866,28 +879,43 @@ def run_structuring_stage(
         "return_usage": True,
     }
 
-    try:
-        result = run_structuring_batch(**structuring_kwargs)
-    except FileExistsError as exc:
-        raise PipelineFailure(
-            ExitCode.STRUCTURING,
-            reason=str(exc),
-            stage_num=2,
-            stage_label="structuring",
-            chapter=chapter,
-            expected_outputs=[json_output, md_output],
-            suggestion="Re-run with --force to overwrite existing structuring outputs.",
-        ) from exc
-    except Exception as exc:  # noqa: BLE001
-        raise PipelineFailure(
-            ExitCode.STRUCTURING,
-            reason=f"Structuring failed for chapter {chapter}: {exc}",
-            stage_num=2,
-            stage_label="structuring",
-            chapter=chapter,
-            expected_outputs=[json_output, md_output],
-            suggestion="Check batch job status and logs; fix issues then rerun with --force.",
-        ) from exc
+    max_attempts = 2
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            result = run_structuring_batch(**structuring_kwargs)
+            break
+        except FileExistsError as exc:
+            raise PipelineFailure(
+                ExitCode.STRUCTURING,
+                reason=str(exc),
+                stage_num=2,
+                stage_label="structuring",
+                chapter=chapter,
+                expected_outputs=[json_output, md_output],
+                suggestion="Re-run with --force to overwrite existing structuring outputs.",
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            if attempt < max_attempts and _is_retryable_file_download_error(exc):
+                logger.warning(
+                    "Structuring attempt %s/%s for chapter %s failed with retryable download error; retrying.",
+                    attempt,
+                    max_attempts,
+                    chapter,
+                    extra={"event": "structuring_retry", "chapter": chapter, "attempt": attempt},
+                )
+                time.sleep(min(5 * attempt, 30))
+                continue
+            raise PipelineFailure(
+                ExitCode.STRUCTURING,
+                reason=f"Structuring failed for chapter {chapter}: {exc}",
+                stage_num=2,
+                stage_label="structuring",
+                chapter=chapter,
+                expected_outputs=[json_output, md_output],
+                suggestion="Check batch job status and logs; fix issues then rerun with --force.",
+            ) from exc
 
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
         outputs_raw, tokens_raw = result
@@ -952,6 +980,7 @@ def _token_box(extraction: TokenUsage, structuring: TokenUsage) -> list[str]:
     extraction_total = extraction.total
     structuring_total = structuring.total
     grand_input = extraction.input_tokens + structuring.input_tokens
+    grand_cached = extraction.cached_tokens + structuring.cached_tokens
     grand_output = extraction.output_tokens + structuring.output_tokens
     grand_total = grand_input + grand_output
     overall_cache_rate = (extraction.cached_tokens + structuring.cached_tokens) / grand_input * 100 if grand_input else 0.0
@@ -975,6 +1004,7 @@ def _token_box(extraction: TokenUsage, structuring: TokenUsage) -> list[str]:
         "  ├─────────────────────────────────────────────────────────────────┤",
         "  │ GRAND TOTAL                                                     │",
         f"  │   All Input Tokens:  {grand_input:>12,}                    │",
+        f"  │     └─ Cached:       {grand_cached:>12,}                    │",
         f"  │   All Output Tokens: {grand_output:>12,}                    │",
         f"  │   All Tokens:        {grand_total:>12,}                    │",
         f"  │   Overall Cache Rate:{overall_cache_rate:>11.1f}%                 │",
@@ -1070,9 +1100,10 @@ def build_failure_summary(
         [
             "",
             "Token Usage (Before Failure):",
-            f"  Extraction:     {stats.extraction_tokens.total:,} tokens",
-            f"  Structuring:    {stats.structuring_tokens.total:,} tokens",
-            f"  Total:          {stats.extraction_tokens.total + stats.structuring_tokens.total:,} tokens",
+            f"  Input Tokens:      {stats.extraction_tokens.input_tokens + stats.structuring_tokens.input_tokens:,}",
+            f"  Cached Input:      {stats.extraction_tokens.cached_tokens + stats.structuring_tokens.cached_tokens:,}",
+            f"  Output Tokens:     {stats.extraction_tokens.output_tokens + stats.structuring_tokens.output_tokens:,}",
+            f"  Total (in+out):    {stats.extraction_tokens.total + stats.structuring_tokens.total:,}",
             SUMMARY_SEPARATOR,
             f"Pipeline terminated due to fatal error. Partial outputs may exist for chapters 1-{_completed_chapters(stats)}.",
             "To resume, fix the issue and re-run with --force to overwrite existing outputs.",
