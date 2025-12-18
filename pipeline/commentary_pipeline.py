@@ -36,17 +36,9 @@ COMMENTARY_ROOT = PROJECT_ROOT / "commentary-extraction"
 EXTRACTION_DIR = COMMENTARY_ROOT / "batch-commentary-extraction"
 STRUCTURING_DIR = COMMENTARY_ROOT / "commentary-structuring" / "batch-commentary-structuring"
 
-for _path in (PROJECT_ROOT, COMMENTARY_ROOT, EXTRACTION_DIR, STRUCTURING_DIR):
-    path_str = str(_path)
-    if path_str not in sys.path:
-        sys.path.insert(0, path_str)
 
-# Late imports that rely on sys.path adjustments
-from verses import VersesData  # noqa: E402
-from ocr_loader import OCR_PROVIDERS, load_chapter_boundaries  # noqa: E402
-
-# Load batch runners with unique module names to avoid name collisions
 def _load_module(path: Path, alias: str):
+    """Load a module from a specific file path with a unique alias."""
     spec = importlib.util.spec_from_file_location(alias, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Unable to load module from {path}")
@@ -55,11 +47,32 @@ def _load_module(path: Path, alias: str):
     return module
 
 
+# Load batch runners with isolated sys.path to avoid module name collisions.
+# Both extraction and structuring have identically-named files (prepare_batch.py, etc.)
+# so we must ensure each module's directory is at the front of sys.path when it loads.
+
+# Step 1: Set up sys.path for extraction module, then load it
+for _path in (PROJECT_ROOT, COMMENTARY_ROOT, EXTRACTION_DIR):
+    path_str = str(_path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
 _extraction_module = _load_module(EXTRACTION_DIR / "batch_all.py", "commentary_extraction_batch_all")
+run_extraction_batch = _extraction_module.run_all
+
+# Step 2: Now add structuring directory and load structuring module
+# Insert at position 0 so structuring's prepare_batch.py is found first
+_structuring_path_str = str(STRUCTURING_DIR)
+if _structuring_path_str not in sys.path:
+    sys.path.insert(0, _structuring_path_str)
+
 _structuring_module = _load_module(
     STRUCTURING_DIR / "batch_all.py", "commentary_structuring_batch_all"
 )
-run_extraction_batch = _extraction_module.run_all
+
+# Late imports that rely on sys.path adjustments
+from verses import VersesData  # noqa: E402
+from ocr_loader import OCR_PROVIDERS, load_chapter_boundaries  # noqa: E402
 run_structuring_batch = _structuring_module.run_all
 
 # Constants -------------------------------------------------------------------
