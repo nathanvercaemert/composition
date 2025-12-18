@@ -4,17 +4,43 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import logging
 import sys
 from pathlib import Path
 from typing import Dict, Tuple
 
-from poll_batch import poll_batch  # noqa: E402
-from prepare_batch import prepare_batch_requests  # noqa: E402
-from process_results import process_results  # noqa: E402
-from retrieve_batch import retrieve_batch_outputs  # noqa: E402
-from submit_batch import submit_batch  # noqa: E402
+# Load local modules with unique aliases to avoid collisions with extraction modules
+MODULE_DIR = Path(__file__).resolve().parent
+
+
+def _load_local_module(module_name: str):
+    path = MODULE_DIR / f"{module_name}.py"
+    spec = importlib.util.spec_from_file_location(f"commentary_structuring_{module_name}", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load structuring module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    # Ensure the module is registered before execution so decorators (dataclass) can resolve __module__
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_prepare_batch = _load_local_module("prepare_batch")
+prepare_batch_requests = _prepare_batch.prepare_batch_requests
+
+_poll_batch = _load_local_module("poll_batch")
+poll_batch = _poll_batch.poll_batch
+
+_process_results = _load_local_module("process_results")
+process_results = _process_results.process_results
+
+_retrieve_batch = _load_local_module("retrieve_batch")
+retrieve_batch_outputs = _retrieve_batch.retrieve_batch_outputs
+
+_submit_batch = _load_local_module("submit_batch")
+submit_batch = _submit_batch.submit_batch
 
 logger = logging.getLogger(__name__)
 
