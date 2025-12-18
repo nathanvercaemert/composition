@@ -92,6 +92,12 @@ LOG_LEVELS = {
     "ERROR": logging.ERROR,
 }
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+EXTRACTION_MAX_ATTEMPTS = 2  # initial attempt + one automatic retry
+EXTRACTION_RETRY_DELAY_SECONDS = 20
+RETRYABLE_EXTRACTION_MESSAGES = (
+    "has no output_file_id",
+    "not completed or has no output_file_id",
+)
 
 
 class ExitCode(IntEnum):
@@ -724,6 +730,14 @@ def _is_retryable_file_download_error(exc: Exception) -> bool:
     return "server error" in message and "/files/" in message
 
 
+def _is_retryable_extraction_failure(exc: Exception) -> bool:
+    """Determine if an extraction attempt should be retried automatically."""
+    message = str(exc).lower()
+    if any(token in message for token in RETRYABLE_EXTRACTION_MESSAGES):
+        return True
+    return _is_retryable_file_download_error(exc)
+
+
 def run_extraction_stage(
     book_name: str,
     chapter: int,
@@ -772,8 +786,34 @@ def run_extraction_stage(
         }
     )
 
+    result: object | None = None
     try:
-        result = run_extraction_batch(**extraction_kwargs)
+        for attempt in range(1, EXTRACTION_MAX_ATTEMPTS + 1):
+            try:
+                result = run_extraction_batch(**extraction_kwargs)
+                break
+            except FileExistsError:
+                # Do not retry when outputs already exist; propagate as before
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if attempt < EXTRACTION_MAX_ATTEMPTS and _is_retryable_extraction_failure(exc):
+                    logger.warning(
+                        "Extraction attempt %s/%s failed; retrying in %ss: %s",
+                        attempt,
+                        EXTRACTION_MAX_ATTEMPTS,
+                        EXTRACTION_RETRY_DELAY_SECONDS,
+                        exc,
+                        extra={
+                            "event": "extraction_retry",
+                            "stage": "extraction",
+                            "chapter": chapter,
+                            "attempt": attempt,
+                            "max_attempts": EXTRACTION_MAX_ATTEMPTS,
+                        },
+                    )
+                    time.sleep(EXTRACTION_RETRY_DELAY_SECONDS)
+                    continue
+                raise
     except FileExistsError as exc:
         raise PipelineFailure(
             ExitCode.EXTRACTION,
@@ -787,12 +827,14 @@ def run_extraction_stage(
     except Exception as exc:  # noqa: BLE001
         raise PipelineFailure(
             ExitCode.EXTRACTION,
-            reason=f"Extraction failed for chapter {chapter}: {exc}",
+            reason=f"Extraction failed for chapter {chapter} after {EXTRACTION_MAX_ATTEMPTS} attempt(s): {exc}",
             stage_num=1,
             stage_label="extraction",
             chapter=chapter,
             expected_outputs=[expected_output],
-            suggestion="Check batch job status and logs; fix issues then rerun with --force.",
+            suggestion=(
+                "Check batch job status and logs; rerun with --force after addressing the underlying issue."
+            ),
         ) from exc
 
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):

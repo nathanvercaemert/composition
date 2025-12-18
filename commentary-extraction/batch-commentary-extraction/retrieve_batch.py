@@ -136,9 +136,6 @@ def retrieve_batch_outputs(
     batch_status = _fetch_batch(api_key, batch_id)
 
     output_file_id = batch_status.get("output_file_id")
-    if not output_file_id:
-        raise RuntimeError(f"Batch {batch_id} is not completed or has no output_file_id yet (status={batch_status.get('status')})")
-
     error_file_id = batch_status.get("error_file_id")
 
     book, chapter = _infer_book_chapter(batch_data)
@@ -153,14 +150,32 @@ def retrieve_batch_outputs(
         output_path = target_dir / f"{batch_id}_output.jsonl"
         error_path = target_dir / f"{batch_id}_errors.jsonl"
 
+    downloaded_error_path: Path | None = None
+    if not output_file_id:
+        if include_errors and error_file_id:
+            try:
+                _download_file(api_key, error_file_id, error_path)
+                downloaded_error_path = error_path
+                logger.error("Batch %s failed; errors downloaded to %s", batch_id, error_path)
+            except Exception as exc:  # pragma: no cover - best effort error download
+                logger.warning("Batch %s failed; unable to download error file %s: %s", batch_id, error_file_id, exc)
+
+        status = batch_status.get("status")
+        detail = f"Batch {batch_id} is not completed or has no output_file_id yet (status={status})"
+        if downloaded_error_path:
+            detail += f"; errors saved to {downloaded_error_path}"
+        raise RuntimeError(detail)
+
     _download_file(api_key, output_file_id, output_path)
     logger.info("Downloaded output to %s", output_path)
 
-    downloaded_error_path: Path | None = None
     if include_errors and error_file_id:
-        _download_file(api_key, error_file_id, error_path)
-        downloaded_error_path = error_path
-        logger.info("Downloaded errors to %s", error_path)
+        try:
+            _download_file(api_key, error_file_id, error_path)
+            downloaded_error_path = error_path
+            logger.info("Downloaded errors to %s", error_path)
+        except Exception as exc:  # pragma: no cover - best effort error download
+            logger.warning("Batch %s completed but failed to download error file %s: %s", batch_id, error_file_id, exc)
 
     if batch_file:
         updates = {
