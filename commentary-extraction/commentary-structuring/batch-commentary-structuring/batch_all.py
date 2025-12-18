@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
-from typing import Tuple
+from typing import Dict, Tuple
 
 from poll_batch import poll_batch  # noqa: E402
 from prepare_batch import prepare_batch_requests  # noqa: E402
@@ -45,6 +46,46 @@ def _reasoning_flag_kwargs(reasoning_effort: str, use_reasoning: bool) -> dict:
     return flags
 
 
+def _collect_token_usage(output_jsonl: Path) -> Dict[str, int]:
+    """Parse a batch output JSONL file and aggregate token usage."""
+    totals = {"input_tokens": 0, "cached_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0}
+    if not output_jsonl.exists():
+        logger.warning("Cannot collect token usage; output file missing: %s", output_jsonl)
+        return totals
+
+    try:
+        with output_jsonl.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                body = (entry.get("response") or {}).get("body") or {}
+                usage = body.get("usage") or {}
+                if not isinstance(usage, dict):
+                    continue
+
+                input_tokens = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+                output_tokens = usage.get("output_tokens") or usage.get("completion_tokens") or 0
+                input_details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
+                output_details = usage.get("output_tokens_details") or usage.get("completion_tokens_details") or {}
+                cached_tokens = input_details.get("cached_tokens") or 0
+                reasoning_tokens = output_details.get("reasoning_tokens") or 0
+
+                totals["input_tokens"] += int(input_tokens or 0)
+                totals["output_tokens"] += int(output_tokens or 0)
+                totals["cached_tokens"] += int(cached_tokens or 0)
+                totals["reasoning_tokens"] += int(reasoning_tokens or 0)
+    except Exception as exc:  # pragma: no cover - best effort aggregation
+        logger.warning("Failed to collect token usage from %s: %s", output_jsonl, exc)
+
+    return totals
+
+
 def run_all(
     book_name: str,
     chapter_number: int,
@@ -59,8 +100,9 @@ def run_all(
     reasoning_effort: str = "high",
     use_reasoning: bool = True,
     cleanup: bool = False,
-) -> Tuple[Path, Path]:
-    """Run the entire batch structuring workflow. Returns (json_path, md_path)."""
+    return_usage: bool = False,
+) -> Tuple[Path, Path] | Tuple[Tuple[Path, Path], Dict[str, int]]:
+    """Run the entire batch structuring workflow. Returns (json_path, md_path) and optionally token usage."""
     temp_dir.mkdir(parents=True, exist_ok=True)
 
     reasoning_kwargs = _reasoning_flag_kwargs(reasoning_effort, use_reasoning=use_reasoning)
@@ -77,6 +119,10 @@ def run_all(
     batch_info_path = submit_batch(jsonl_path, meta_file=meta_path)
     poll_batch(batch_info_path, watch=True, interval=poll_interval)
     output_path, error_path = retrieve_batch_outputs(batch_info_path, output_dir=temp_dir, include_errors=True)
+
+    token_usage: Dict[str, int] | None = None
+    if return_usage:
+        token_usage = _collect_token_usage(output_path)
 
     json_output_path, md_output_path = process_results(
         output_path,
@@ -96,6 +142,8 @@ def run_all(
                 except Exception as exc:  # pragma: no cover - best effort
                     logger.warning("Failed to delete %s: %s", path, exc)
 
+    if return_usage and token_usage is not None:
+        return (json_output_path, md_output_path), token_usage
     return json_output_path, md_output_path
 
 

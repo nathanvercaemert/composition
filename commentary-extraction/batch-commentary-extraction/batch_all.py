@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 from prepare_batch import prepare_batch_requests  # noqa: E402
 from process_results import process_results  # noqa: E402
@@ -18,6 +19,45 @@ from submit_batch import submit_batch  # noqa: E402
 logger = logging.getLogger(__name__)
 
 DEFAULT_TEMP_DIR = Path("temp/batch-commentary-extraction")
+
+
+def _collect_token_usage(output_jsonl: Path) -> Dict[str, int]:
+    """Parse a batch output JSONL file and aggregate token usage."""
+    totals = {"input_tokens": 0, "cached_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0}
+    if not output_jsonl.exists():
+        logger.warning("Cannot collect token usage; output file missing: %s", output_jsonl)
+        return totals
+
+    try:
+        with output_jsonl.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                body = (entry.get("response") or {}).get("body") or {}
+                usage = body.get("usage") or {}
+                if not isinstance(usage, dict):
+                    continue
+
+                input_tokens = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+                output_tokens = usage.get("output_tokens") or usage.get("completion_tokens") or 0
+                input_details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
+                output_details = usage.get("output_tokens_details") or usage.get("completion_tokens_details") or {}
+                cached_tokens = input_details.get("cached_tokens") or 0
+                reasoning_tokens = output_details.get("reasoning_tokens") or 0
+
+                totals["input_tokens"] += int(input_tokens or 0)
+                totals["output_tokens"] += int(output_tokens or 0)
+                totals["cached_tokens"] += int(cached_tokens or 0)
+                totals["reasoning_tokens"] += int(reasoning_tokens or 0)
+    except Exception as exc:  # pragma: no cover - best effort aggregation
+        logger.warning("Failed to collect token usage from %s: %s", output_jsonl, exc)
+
+    return totals
 
 
 def run_all(
@@ -35,8 +75,9 @@ def run_all(
     high_reasoning: bool = False,
     xhigh_reasoning: bool = False,
     cleanup: bool = False,
-) -> Path:
-    """Run the entire batch workflow and return the final output path."""
+    return_usage: bool = False,
+) -> Path | Tuple[Path, Dict[str, int]]:
+    """Run the entire batch workflow and return the final output path (and tokens when requested)."""
     temp_dir.mkdir(parents=True, exist_ok=True)
 
     jsonl_path, meta_path = prepare_batch_requests(
@@ -54,6 +95,10 @@ def run_all(
     poll_batch(batch_info_path, watch=True, interval=poll_interval)
     output_path, error_path = retrieve_batch_outputs(batch_info_path, output_dir=temp_dir, include_errors=True)
 
+    token_usage: Dict[str, int] | None = None
+    if return_usage:
+        token_usage = _collect_token_usage(output_path)
+
     final_output = process_results(
         output_path,
         meta_file=meta_path,
@@ -70,6 +115,8 @@ def run_all(
                 except Exception as exc:  # pragma: no cover - best effort
                     logger.warning("Failed to delete %s: %s", path, exc)
 
+    if return_usage and token_usage is not None:
+        return final_output, token_usage
     return final_output
 
 
