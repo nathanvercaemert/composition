@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Dict, Tuple
@@ -23,6 +25,7 @@ logger = logging.getLogger(__name__)
 BATCHES_URL = "https://api.openai.com/v1/batches"
 FILES_URL = "https://api.openai.com/v1/files"
 DEFAULT_COMPLETION_WINDOW = "24h"
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 def _parse_metadata_args(pairs: list[str]) -> Dict[str, str]:
@@ -64,15 +67,70 @@ def _infer_book_chapter(jsonl_path: Path, meta_path: Path | None) -> Tuple[str |
     return None, None
 
 
-def _upload_file(api_key: str, jsonl_path: Path) -> Dict[str, object]:
-    """Upload the JSONL file to OpenAI Files API."""
+def _backoff_delay(
+    attempt: int,
+    *,
+    base: float = 1.5,
+    max_delay: float = 60.0,
+    jitter_ratio: float = 0.25,
+) -> float:
+    """Compute an exponential backoff delay with optional jitter."""
+    delay = min(base * (2 ** (attempt - 1)), max_delay)
+    if jitter_ratio > 0:
+        jitter = delay * jitter_ratio
+        delay = max(0.0, delay + random.uniform(-jitter, jitter))
+    return delay
+
+
+def _upload_file(
+    api_key: str,
+    jsonl_path: Path,
+    *,
+    max_retries: int = 6,
+    backoff_base: float = 1.5,
+    max_backoff: float = 60.0,
+) -> Dict[str, object]:
+    """Upload the JSONL file to OpenAI Files API with resilient retry/backoff for 5xx/429 errors."""
     headers = {"Authorization": f"Bearer {api_key}"}
-    with jsonl_path.open("rb") as fh:
-        files = {"file": (jsonl_path.name, fh, "application/jsonl")}
-        data = {"purpose": "batch"}
-        resp = requests.post(FILES_URL, headers=headers, files=files, data=data, timeout=600)
-    resp.raise_for_status()
-    return resp.json()
+    attempt = 0
+
+    while True:
+        attempt += 1
+        try:
+            with jsonl_path.open("rb") as fh:
+                files = {"file": (jsonl_path.name, fh, "application/jsonl")}
+                data = {"purpose": "batch"}
+                resp = requests.post(FILES_URL, headers=headers, files=files, data=data, timeout=600)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response else None
+            if status in RETRYABLE_STATUS_CODES and attempt <= max_retries:
+                delay = _backoff_delay(attempt, base=backoff_base, max_delay=max_backoff)
+                logger.warning(
+                    "Upload to %s failed with status %s (attempt %s/%s). Retrying in %.1fs.",
+                    FILES_URL,
+                    status,
+                    attempt,
+                    max_retries,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            raise
+        except requests.RequestException:
+            if attempt <= max_retries:
+                delay = _backoff_delay(attempt, base=backoff_base, max_delay=max_backoff)
+                logger.warning(
+                    "Upload to %s failed (attempt %s/%s). Retrying in %.1fs.",
+                    FILES_URL,
+                    attempt,
+                    max_retries,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            raise
 
 
 def _create_batch(
@@ -81,8 +139,11 @@ def _create_batch(
     input_file_id: str,
     completion_window: str,
     metadata: Dict[str, str] | None,
+    max_retries: int = 6,
+    backoff_base: float = 1.5,
+    max_backoff: float = 60.0,
 ) -> Dict[str, object]:
-    """Create a batch job via the OpenAI Batches API."""
+    """Create a batch job via the OpenAI Batches API with retry/backoff on transient errors."""
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -95,9 +156,39 @@ def _create_batch(
     if metadata:
         payload["metadata"] = metadata
 
-    resp = requests.post(BATCHES_URL, headers=headers, data=json.dumps(payload), timeout=600)
-    resp.raise_for_status()
-    return resp.json()
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            resp = requests.post(BATCHES_URL, headers=headers, data=json.dumps(payload), timeout=600)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response else None
+            if status in RETRYABLE_STATUS_CODES and attempt <= max_retries:
+                delay = _backoff_delay(attempt, base=backoff_base, max_delay=max_backoff)
+                logger.warning(
+                    "Batch creation failed with status %s (attempt %s/%s). Retrying in %.1fs.",
+                    status,
+                    attempt,
+                    max_retries,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            raise
+        except requests.RequestException:
+            if attempt <= max_retries:
+                delay = _backoff_delay(attempt, base=backoff_base, max_delay=max_backoff)
+                logger.warning(
+                    "Batch creation request failed (attempt %s/%s). Retrying in %.1fs.",
+                    attempt,
+                    max_retries,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            raise
 
 
 def submit_batch(
