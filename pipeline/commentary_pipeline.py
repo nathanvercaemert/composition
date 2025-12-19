@@ -536,6 +536,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=argparse.SUPPRESS,  # retained for forward compatibility; no effect.
     )
+    parser.add_argument(
+        "--skip-extraction",
+        action="store_true",
+        help="Reuse existing chapter JSON and skip the extraction stage.",
+    )
     return parser.parse_args()
 
 
@@ -736,6 +741,56 @@ def _is_retryable_extraction_failure(exc: Exception) -> bool:
     if any(token in message for token in RETRYABLE_EXTRACTION_MESSAGES):
         return True
     return _is_retryable_file_download_error(exc)
+
+
+def _reuse_extraction_output(
+    book_name: str, chapter: int, *, logger: logging.Logger
+) -> tuple[StageStatistics, Path]:
+    """Build a successful extraction stage from an existing output file."""
+    stage = StageStatistics(
+        stage_num=1,
+        label="Extraction",
+        chapter=chapter,
+        start_time=datetime.now(tz=timezone.utc).astimezone(),
+    )
+    output_path = PROJECT_ROOT / "books" / book_name / "chapters" / f"{chapter}.json"
+
+    if not output_path.exists():
+        raise PipelineFailure(
+            ExitCode.EXTRACTION,
+            reason=(
+                f"--skip-extraction was provided but expected extraction output is missing: "
+                f"{output_path.as_posix()}"
+            ),
+            stage_num=1,
+            stage_label="extraction",
+            chapter=chapter,
+            expected_outputs=[output_path],
+            suggestion="Remove --skip-extraction or regenerate the extraction output with --force.",
+        )
+
+    logger.info(
+        "Skipping extraction for chapter %s; reusing %s",
+        chapter,
+        output_path,
+        extra={"event": "extraction_skipped", "chapter": chapter, "path": output_path.as_posix()},
+    )
+
+    payload = _load_json(output_path)
+    metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+    verses_with_errors = _validate_verses_error_count(metadata, 1, "extraction", chapter)
+
+    _finalize_stage(stage, [output_path], verses_with_errors, TokenUsage())
+    logger.info(
+        "Reused extraction output for chapter %s",
+        chapter,
+        extra={
+            "event": "extraction_reused",
+            "chapter": chapter,
+            "verses_with_errors": verses_with_errors,
+        },
+    )
+    return stage, output_path
 
 
 def run_extraction_stage(
@@ -1204,17 +1259,22 @@ def run_pipeline() -> None:
             extraction_temp = chapter_temp_base / "extraction"
             structuring_temp = chapter_temp_base / "structuring"
 
-            extraction_stage, extraction_output = run_extraction_stage(
-                book_name,
-                chapter,
-                force=args.force,
-                poll_interval=args.poll_interval,
-                temp_dir=extraction_temp,
-                logger=logger.logger,
-                cleanup=args.cleanup,
-                reasoning_effort=reasoning_effort,
-                use_reasoning=use_reasoning,
-            )
+            if args.skip_extraction:
+                extraction_stage, extraction_output = _reuse_extraction_output(
+                    book_name, chapter, logger=logger.logger
+                )
+            else:
+                extraction_stage, extraction_output = run_extraction_stage(
+                    book_name,
+                    chapter,
+                    force=args.force,
+                    poll_interval=args.poll_interval,
+                    temp_dir=extraction_temp,
+                    logger=logger.logger,
+                    cleanup=args.cleanup,
+                    reasoning_effort=reasoning_effort,
+                    use_reasoning=use_reasoning,
+                )
             chapter_stats.extraction = extraction_stage
             stats.extraction_tokens.add(extraction_stage.token_usage)
 
