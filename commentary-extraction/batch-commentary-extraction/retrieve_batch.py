@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import sys
 import time
 from pathlib import Path
@@ -43,22 +44,41 @@ def _fetch_batch(api_key: str, batch_id: str) -> Dict[str, object]:
     return resp.json()
 
 
+def _backoff_delay(
+    attempt: int,
+    *,
+    base: float = 1.5,
+    max_delay: float = 60.0,
+    jitter_ratio: float = 0.25,
+) -> float:
+    """Compute an exponential backoff delay with optional jitter."""
+    delay = min(base * (2 ** (attempt - 1)), max_delay)
+    if jitter_ratio > 0:
+        jitter = delay * jitter_ratio
+        delay = max(0.0, delay + random.uniform(-jitter, jitter))
+    return delay
+
+
 def _download_file(
     api_key: str,
     file_id: str,
     dest: Path,
     *,
-    max_retries: int = 3,
+    max_retries: int = 6,
     backoff_base: float = 1.5,
+    max_backoff: float = 60.0,
 ) -> None:
-    """Download a file's content to disk with simple retry/backoff for transient errors."""
+    """Download a file's content to disk with resilient exponential backoff for transient server errors."""
     headers = {"Authorization": f"Bearer {api_key}"}
     attempt = 0
 
     while True:
         try:
             with requests.get(
-                f"{FILES_URL}/{file_id}/content", headers=headers, timeout=600, stream=True
+                f"{FILES_URL}/{file_id}/content",
+                headers=headers,
+                timeout=600,
+                stream=True,
             ) as resp:
                 status = resp.status_code
                 resp.raise_for_status()
@@ -72,7 +92,7 @@ def _download_file(
             status = exc.response.status_code if exc.response else None
             attempt += 1
             if status in RETRYABLE_STATUS_CODES and attempt <= max_retries:
-                delay = min(backoff_base * (2 ** (attempt - 1)), 30)
+                delay = _backoff_delay(attempt, base=backoff_base, max_delay=max_backoff)
                 logger.warning(
                     "Download for file %s failed with status %s (attempt %s/%s). Retrying in %.1fs.",
                     file_id,
@@ -81,6 +101,7 @@ def _download_file(
                     max_retries,
                     delay,
                 )
+                # 500s on /files/.../content are often transient while data propagates.
                 time.sleep(delay)
                 continue
             raise
@@ -88,7 +109,7 @@ def _download_file(
             # Network/connection errors without HTTP status
             attempt += 1
             if attempt <= max_retries:
-                delay = min(backoff_base * (2 ** (attempt - 1)), 30)
+                delay = _backoff_delay(attempt, base=backoff_base, max_delay=max_backoff)
                 logger.warning(
                     "Download for file %s failed (attempt %s/%s). Retrying in %.1fs.",
                     file_id,

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import random
 import time
 from pathlib import Path
 from types import ModuleType
@@ -31,15 +32,31 @@ def _load_extraction_retrieve_batch() -> ModuleType:
     return module
 
 
+def _backoff_delay(
+    attempt: int,
+    *,
+    base: float = 1.5,
+    max_delay: float = 60.0,
+    jitter_ratio: float = 0.25,
+) -> float:
+    """Compute an exponential backoff delay with optional jitter."""
+    delay = min(base * (2 ** (attempt - 1)), max_delay)
+    if jitter_ratio > 0:
+        jitter = delay * jitter_ratio
+        delay = max(0.0, delay + random.uniform(-jitter, jitter))
+    return delay
+
+
 def _download_file_with_retry(
     api_key: str,
     file_id: str,
     dest: Path,
     *,
-    max_retries: int = 3,
+    max_retries: int = 6,
     backoff_base: float = 1.5,
+    max_backoff: float = 60.0,
 ) -> None:
-    """Download a file's content to disk with simple retry/backoff for transient errors."""
+    """Download a file's content to disk with resilient exponential backoff for transient errors."""
     headers = {"Authorization": f"Bearer {api_key}"}
     attempt = 0
 
@@ -63,7 +80,7 @@ def _download_file_with_retry(
             status = exc.response.status_code if exc.response else None
             attempt += 1
             if status in RETRYABLE_STATUS_CODES and attempt <= max_retries:
-                delay = min(backoff_base * (2 ** (attempt - 1)), 30)
+                delay = _backoff_delay(attempt, base=backoff_base, max_delay=max_backoff)
                 logger.warning(
                     "Download for file %s failed with status %s (attempt %s/%s). Retrying in %.1fs.",
                     file_id,
@@ -78,7 +95,7 @@ def _download_file_with_retry(
         except requests.RequestException:
             attempt += 1
             if attempt <= max_retries:
-                delay = min(backoff_base * (2 ** (attempt - 1)), 30)
+                delay = _backoff_delay(attempt, base=backoff_base, max_delay=max_backoff)
                 logger.warning(
                     "Download for file %s failed (attempt %s/%s). Retrying in %.1fs.",
                     file_id,
