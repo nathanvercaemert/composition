@@ -58,7 +58,7 @@ SYSTEM_PROMPT_TEMPLATE = dedent("""\
     |---------|--------|
     | `Gen 1:2` | book="Gen", chapter=1, verse=2 |
     | `1:5` (no book) | book="{book_name}", chapter=1, verse=5 |
-    | `v. 7` or `vv. 7` | book="{book_name}", chapter={chapter_number}, verse=7 |
+    | `vv. 7` | book="{book_name}", chapter={chapter_number}, verse=7 |
     | `vv. 3-7` | book="{book_name}", chapter={chapter_number}, range={{"start":3, "end":7}} |
     | `cf. Rom 8:28` | book="Rom", chapter=8, verse=28 |
     | `ch. 5:3` | book="{book_name}", chapter=5, verse=3 |
